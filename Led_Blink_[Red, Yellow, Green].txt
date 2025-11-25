@@ -1,0 +1,62 @@
+#define RED_LED     12
+#define YEL_LED     13
+#define GRN_LED     14
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(RED_LED, OUTPUT);
+  pinMode(YEL_LED, OUTPUT);
+  pinMode(GRN_LED, OUTPUT);
+
+  // Turn off all LEDs at the start
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(YEL_LED, LOW);
+  digitalWrite(GRN_LED, LOW);
+}
+
+void loop() {
+
+  // ----------------------------
+  // State 1: RED for 5 seconds
+  // ----------------------------
+  Serial.println("STATE 1: RED ON (Pedestrians can cross)");
+  digitalWrite(RED_LED, HIGH);
+  digitalWrite(YEL_LED, LOW);
+  digitalWrite(GRN_LED, LOW);
+
+  // Countdown 5 → 0
+  for (int i = 5; i >= 0; i--) {
+    Serial.println(i);
+    delay(1000);
+  }
+
+  // ----------------------------
+  // State 2: RED + YELLOW for 2 sec
+  // ----------------------------
+  Serial.println("STATE 2: RED + YELLOW ON");
+  digitalWrite(RED_LED, HIGH);
+  digitalWrite(YEL_LED, HIGH);
+  digitalWrite(GRN_LED, LOW);
+  delay(2000);
+
+  // ----------------------------
+  // State 3: GREEN for 5 seconds
+  // ----------------------------
+  Serial.println("STATE 3: GREEN ON");
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(YEL_LED, LOW);
+  digitalWrite(GRN_LED, HIGH);
+  delay(5000);
+
+  // ----------------------------
+  // State 4: YELLOW for 2 seconds
+  // ----------------------------
+  Serial.println("STATE 4: YELLOW ON");
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(YEL_LED, HIGH);
+  digitalWrite(GRN_LED, LOW);
+  delay(2000);
+
+  // Loop back to State 1
+}
