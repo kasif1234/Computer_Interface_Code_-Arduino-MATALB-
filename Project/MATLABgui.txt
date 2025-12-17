@@ -1,0 +1,771 @@
+classdef upperbottomservocontroller_newest < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        UIFigure                     matlab.ui.Figure
+        UltraLabel                   matlab.ui.control.Label
+        TempLabel                    matlab.ui.control.Label
+        FluxLabel                    matlab.ui.control.Label
+        LidarLabel                   matlab.ui.control.Label
+        DefenceSystemMotionButton    matlab.ui.control.Button
+        TurnWebcamOFFButton          matlab.ui.control.Button
+        ScanningModeSensorsButton    matlab.ui.control.Button
+        AdvancedDefenceSystemButton  matlab.ui.control.Button
+        Meter2                       audio.ui.control.Meter
+        FullRotationButton           matlab.ui.control.Button
+        LoggerLabel                  matlab.ui.control.Label
+        SignalConditioningPanel      matlab.ui.container.Panel
+        SystemPowerLamp_2            matlab.ui.control.Lamp
+        LidarMappingUltrasonicPanel  matlab.ui.container.Panel
+        WebCamTrackerPanel           matlab.ui.container.Panel
+        UIAxes                       matlab.ui.control.UIAxes
+        FireLaserButton              matlab.ui.control.Button
+        LaserSlider                  matlab.ui.control.Slider
+        AdjustLaserPowerSliderLabel  matlab.ui.control.Label
+        PitchLabel                   matlab.ui.control.Label
+        RollLabel                    matlab.ui.control.Label
+        ManualControlButton          matlab.ui.control.Button
+        RobotTurretControlPanelMATLABArduinoLabel  matlab.ui.control.Label
+        UpperKnob                    matlab.ui.control.Knob
+        UpperKnobLabel               matlab.ui.control.Label
+        BottomKnob                   matlab.ui.control.Knob
+        BottomKnobLabel              matlab.ui.control.Label
+        SystemModeLabel              matlab.ui.control.Label
+        TestBottomButton             matlab.ui.control.Button
+        TestUpButton                 matlab.ui.control.Button
+    end
+
+
+    % Public properties that correspond to the Simulink model
+    properties (Access = public, Transient)
+        Simulation simulink.Simulation
+    end
+
+    
+    properties (Access = private)
+        
+        s % Serial Object
+        t % Timer Object
+        bottomAngle = 0;
+        upperAngle = 0;
+        cam
+        vid          % <-- add this
+        running              % loop flag
+        prevGray             % serialport to Arduino
+        panAngle  = 90;
+        tiltAngle = 90;
+        faceDetector
+        panErrPrev  = 0;
+        tiltErrPrev  = 0;
+        lastPIDTime = 0;
+
+
+        bottomMin    = 48;
+        bottomMax    = 132;
+        bottomCenter = 90;
+
+        topMin       = 0;
+        topMax       = 38;
+        topCenter    = 19;
+
+
+        
+    end
+    
+    methods (Access = private)
+        
+        function readArduino(app)
+            if app.s.NumBytesAvailable > 0
+                msg = strtrim(readline(app.s));   % read one line
+                % app.SystemModeLabel.Text = msg; % we'll handle it smarter
+    
+                % Check if this is the potentiometer line
+                if startsWith(msg, "Pot control ->")
+                    % Example: "Pot control -> bottom: 73  upper: 142"
+                    tokens = regexp(msg, 'bottom:\s*(\d+)\s*upper:\s*(\d+)', 'tokens');
+    
+                    if ~isempty(tokens)
+                        vals = str2double(tokens{1});    % [bottom upper]
+                        app.bottomAngle = vals(1);
+                        app.upperAngle  = vals(2);
+    
+                        % Update labels
+                        app.RollLabel.Text = sprintf('X AXIS: %d°', app.bottomAngle);
+                        app.PitchLabel.Text = sprintf('Y AXIS: %d°', app.upperAngle);
+    
+                        % Update knobs (if you want them to reflect angle)
+                        app.BottomKnob.Value = app.bottomAngle;
+                        app.UpperKnob.Value  = app.upperAngle;
+    
+                        % Optional: status message
+                        app.SystemModeLabel.Text = " ";
+                    end
+            elseif startsWith(msg, "LiDAR_dist_cm=")
+                % Example line:
+                % LiDAR_dist_cm=228, flux=5370, temp_C=45.0, Ultra_dist_cm=228.5
+        
+                vals = sscanf(msg, 'LiDAR_dist_cm=%f, flux=%f, temp_C=%f, Ultra_dist_cm=%f');
+        
+                if numel(vals) == 4
+                    lidar  = vals(1);
+                    flux   = vals(2);
+                    tempC  = vals(3);
+                    ultra  = vals(4);
+        
+                    % Update GUI labels
+                    app.LidarLabel.Text = sprintf('LiDAR: %.1f cm', lidar);
+                    app.FluxLabel.Text  = sprintf('Flux: %.0f', flux);
+                    app.TempLabel.Text  = sprintf('Temp: %.1f °C', tempC);
+                    app.UltraLabel.Text = sprintf('Ultra: %.1f cm', ultra);
+                end
+
+    
+    
+                else
+                    % Any other message (sweeps, laser fired, etc.)
+                    app.SystemModeLabel.Text = " ";
+                end
+            end
+    end
+
+
+        
+    end
+    
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Code that executes after component creation
+        function startupFcn(app)
+            % Open serial port (COM6 at 9600 baud)
+            app.UIFigure.WindowState = 'maximized';
+            app.BottomKnob.Limits = [app.bottomMin app.bottomMax];
+            app.UpperKnob.Limits  = [app.topMin    app.topMax];
+            
+            % Initialise angles to centers
+            app.panAngle  = app.bottomCenter;
+            app.tiltAngle = app.topCenter;
+            
+            % Reflect in knobs
+            app.BottomKnob.Value = app.panAngle;
+            app.UpperKnob.Value  = app.tiltAngle;
+
+
+          
+          
+
+            app.s = serialport("COM3", 115200);
+        
+            pause(2);  % Allow ESP32 to reset and start sending
+        
+            % Clear any old data in the buffer
+            flush(app.s);
+        
+            % Update GUI message
+            app.SystemModeLabel.Text = "Connected to ESP32";
+        
+            % Create timer to read messages every 0.5 seconds
+            app.t = timer;
+            app.t.ExecutionMode = "fixedRate";
+            app.t.Period = 0.05;
+        
+            % Timer callback – passes the app object
+            app.t.TimerFcn = @(~,~) readArduino(app);
+        
+            % Start the timer
+            start(app.t);
+            
+            
+
+            % --- Webcam setup ---   % <--- ADDED
+            camNames = webcamlist;
+            if isempty(camNames)
+                app.SystemModeLabel.Text = "No webcam detected";
+            else
+            dcIdx = find(strcmp(camNames,'DroidCam Video'),2);
+                if isempty(dcIdx)
+                    app.SystemModeLabel.Text = "DroidCam not found, using first camera";
+                    app.cam = webcam(camNames{2});
+    
+                else
+                    app.cam = webcam(camNames{dcIdx});   % <<-- DroidCam
+                end
+                
+            
+                frame = snapshot(app.cam);
+                hImage = image(app.UIAxes, frame);
+                axis(app.UIAxes, 'image');
+                preview(app.cam, hImage);
+            end
+
+          
+
+        end
+
+        % Button pushed function: TestUpButton
+        function TestUpButtonPushed(app, event)
+            writeline(app.s, "1"); 
+            app.SystemModeLabel.Text = "Upper servo command sent";
+        end
+
+        % Button pushed function: TestBottomButton
+        function TestBottomButtonPushed(app, event)
+            writeline(app.s, "0");              % 1 = upper servo in Arduino
+            app.SystemModeLabel.Text = "Bottom servo command sent";
+        end
+
+        % Button pushed function: ManualControlButton
+        function ManualControlButtonPushed(app, event)
+            writeline(app.s, "3");
+            app.SystemModeLabel.FontColor = [1 1 1];
+            app.SystemModeLabel.BackgroundColor = [0 0 0];
+            app.RollLabel.Text = sprintf('X AXIS: %d°', app.bottomAngle);
+            app.PitchLabel.Text = sprintf('Y AXIS: %d°', app.upperAngle);
+            app.SystemModeLabel.Text = "Manual Control";
+            
+            
+        end
+
+        % Button pushed function: FireLaserButton
+        function FireLaserButtonPushed(app, event)
+            writeline(app.s, "2");
+            app.SystemModeLabel.FontColor = [0 0 0];
+            app.SystemModeLabel.Text = "LASER FIRED";
+            app.SystemModeLabel.BackgroundColor = [1 0 0];
+           
+        end
+
+        % Value changed function: LaserSlider
+        function LaserSliderValueChanged(app, event)
+            val = round(event.Value);
+            cmd = sprintf("L%d\n", val);
+            write(app.s, cmd, "string");
+            
+        end
+
+        % Value changing function: LaserSlider
+        function LaserSliderValueChanging(app, event)
+            %val = app.LaserSlider.Value;     % assume slider 0–100
+            %val = round(val);
+            %cmd = sprintf("L%d\n", val);     % e.g. "L75\n"
+
+            %write(app.s, cmd, "string");
+            
+        end
+
+        % Button pushed function: AdvancedDefenceSystemButton
+        function AdvancedDefenceSystemButtonPushed(app, event)
+            % Lidar + Ultrasonic + Camera
+            writeline(app.s, "4");
+            
+
+        end
+
+        % Button pushed function: TurnWebcamOFFButton
+        function TurnWebcamOFFButtonPushed(app, event)
+            % Stop loop
+            app.running = false;
+            pause(0.2);   % let loop exit
+
+            % Release webcam
+            if ~isempty(app.cam)
+                clear app.cam
+                app.cam = [];
+            end
+
+            app.prevGray = [];
+            % angles stay where they were; you can reset if you want:
+            % app.panAngle  = 90;
+            % app.tiltAngle = 90;
+        
+        end
+
+        % Button pushed function: DefenceSystemMotionButton
+        function DefenceSystemMotionButtonPushed(app, event)
+           
+
+            % Make sure camera is ready
+            if isempty(app.cam) || ~isvalid(app.cam)
+                app.SystemModeLabel.Text = "Camera not initialised";
+                return;
+            end
+        
+            % Get one frame to know width & height
+            frame = snapshot(app.cam);
+            gray  = rgb2gray(frame);
+            [h, w, ~] = size(frame);  %#ok<ASGLU>  % we only need w,h
+        
+            % Send frame size to Arduino: "F<width> <height>"
+            if ~isempty(app.s)
+                line = sprintf("F%d %d\n", w, h);
+                writeline(app.s, line);
+            end
+        
+            % Init tracking state
+            app.running  = true;
+            app.prevGray = gray;
+        
+            % Simple motion-based object localization
+            boxWidth  = 100;
+            boxHeight = 100;
+        
+            % ---- SERIAL RATE LIMITING ----
+            movementThreshPx = 4;      % only send if moved > this many pixels
+            sendEveryN       = 5;      % only send on every Nth detection
+            frameCount       = 0;
+            lastSendX        = [];
+            lastSendY        = [];
+        
+            while app.running
+        
+                % If app or camera was destroyed/cleared, exit cleanly
+                if ~isvalid(app) || isempty(app.cam) || ~isvalid(app.cam)
+                    break;
+                end
+        
+                % 1) New frame
+                frame = snapshot(app.cam);
+                gray  = rgb2gray(frame);
+        
+                % If prevGray was cleared elsewhere, re-init and skip diff this round
+                if isempty(app.prevGray)
+                    app.prevGray = gray;
+        
+                    image(app.UIAxes, frame);
+                    axis(app.UIAxes, 'image');
+                    app.UIAxes.Visible = 'on';
+                    drawnow limitrate;
+                    continue;
+                end
+        
+                % 2) Motion detection versus previous frame
+                        % 2) Motion detection versus previous frame
+                diffFrame = abs(double(gray) - double(app.prevGray));
+                bw = diffFrame > 30;
+        
+                % ===== NO-MOTION FILTER =====
+                % Count how many pixels changed
+                motionPixels = nnz(bw);
+                minMotionPixels = 800;   % tune this (bigger = ignore more noise)
+        
+                if motionPixels < minMotionPixels
+                    % Not enough change -> treat as NO motion:
+                    % - do NOT send anything
+                    % - just update prevGray and display
+                    app.prevGray = gray;
+        
+                    image(app.UIAxes, frame);
+                    axis(app.UIAxes, 'image');
+                    app.UIAxes.Visible = 'on';
+                    drawnow limitrate;
+                    continue;
+                end
+        
+                % ===== SIGNIFICANT MOTION -> find blob center =====
+                rowSum = sum(bw, 2);
+                colSum = sum(bw, 1);
+        
+                rows = find(rowSum > 20);
+                cols = find(colSum > 20);
+        
+                if ~isempty(rows) && ~isempty(cols)
+                    % Motion center in image (pixels, 1-based)
+                    yCenter = round(mean(rows));
+                    xCenter = round(mean(cols));
+        
+                    % Convert to 0-based pixels for Arduino (0 .. w-1, 0 .. h-1)
+                    xPix = xCenter - 1;
+                    yPix = yCenter - 1;
+        
+                    % Clamp
+                    xPix = max(0, min(w - 1, xPix));
+                    yPix = max(0, min(h - 1, yPix));
+        
+                    % --- SERIAL WRITE DECISION ---
+                    frameCount = frameCount + 1;
+                    sendNow = false;
+        
+                    if isempty(lastSendX)
+                        sendNow = true;
+                    else
+                        dx = abs(xPix - lastSendX);
+                        dy = abs(yPix - lastSendY);
+        
+                        if (dx > movementThreshPx || dy > movementThreshPx) && mod(frameCount, sendEveryN) == 0
+                            sendNow = true;
+                        end
+                    end
+        
+                    if sendNow && ~isempty(app.s)
+                        line = sprintf("X%d Y%d\n", xPix, yPix);
+                        writeline(app.s, line);
+                        writeline(app.s, "2");   % your laser trigger
+                        lastSendX = xPix;
+                        lastSendY = yPix;
+                    end
+        
+                    % Draw box for visualization (unchanged)
+                    xmin = xCenter - floor(boxWidth/2);
+                    xmax = xCenter + floor(boxWidth/2);
+                    ymin = yCenter - floor(boxHeight/2);
+                    ymax = yCenter + floor(boxHeight/2);
+        
+                    xmin = max(1, xmin);
+                    ymin = max(1, ymin);
+                    xmax = min(w, xmax);
+                    ymax = min(h, ymax);
+        
+                    frame(ymin, xmin:xmax, 1) = 255;
+                    frame(ymin, xmin:xmax, 2) = 0;
+                    frame(ymin, xmin:xmax, 3) = 0;
+        
+                    frame(ymax, xmin:xmax, 1) = 255;
+                    frame(ymax, xmin:xmax, 2) = 0;
+                    frame(ymax, xmin:xmax, 3) = 0;
+        
+                    frame(ymin:ymax, xmin, 1) = 255;
+                    frame(ymin:ymax, xmin, 2) = 0;
+                    frame(ymin:ymax, xmin, 3) = 0;
+        
+                    frame(ymin:ymax, xmax, 1) = 255;
+                    frame(ymin:ymax, xmax, 2) = 0;
+                    frame(ymin:ymax, xmax, 3) = 0;
+                end
+
+        
+                % Update previous frame
+                app.prevGray = gray;
+        
+                % Show on UIAxes
+                image(app.UIAxes, frame);
+                axis(app.UIAxes, 'image');
+                app.UIAxes.Visible = 'on';
+                drawnow limitrate;
+            end
+
+
+
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UIFigure and components
+        function createComponents(app)
+
+            % Create UIFigure and hide until all components are created
+            app.UIFigure = uifigure('Visible', 'off');
+            app.UIFigure.Color = [0.2 0.2 0.2];
+            app.UIFigure.Position = [1 1 1920 1050];
+            app.UIFigure.Name = 'MATLAB App';
+
+            % Create TestUpButton
+            app.TestUpButton = uibutton(app.UIFigure, 'push');
+            app.TestUpButton.ButtonPushedFcn = createCallbackFcn(app, @TestUpButtonPushed, true);
+            app.TestUpButton.BackgroundColor = [1 0.9098 0.3922];
+            app.TestUpButton.FontName = 'Sitka Text';
+            app.TestUpButton.FontSize = 24;
+            app.TestUpButton.FontColor = [0 0 0];
+            app.TestUpButton.Position = [957 743 184 68];
+            app.TestUpButton.Text = 'Test Up';
+
+            % Create TestBottomButton
+            app.TestBottomButton = uibutton(app.UIFigure, 'push');
+            app.TestBottomButton.ButtonPushedFcn = createCallbackFcn(app, @TestBottomButtonPushed, true);
+            app.TestBottomButton.WordWrap = 'on';
+            app.TestBottomButton.BackgroundColor = [1 0.9098 0.3922];
+            app.TestBottomButton.FontName = 'Sitka Text';
+            app.TestBottomButton.FontSize = 24;
+            app.TestBottomButton.FontColor = [0 0 0];
+            app.TestBottomButton.Position = [957 655 184 74];
+            app.TestBottomButton.Text = 'Test Bottom';
+
+            % Create SystemModeLabel
+            app.SystemModeLabel = uilabel(app.UIFigure);
+            app.SystemModeLabel.BackgroundColor = [0.7529 0.3608 0.9843];
+            app.SystemModeLabel.HorizontalAlignment = 'center';
+            app.SystemModeLabel.FontName = 'Sitka Text';
+            app.SystemModeLabel.FontSize = 48;
+            app.SystemModeLabel.FontColor = [0 0 0];
+            app.SystemModeLabel.Position = [1166 945 633 59];
+            app.SystemModeLabel.Text = 'System Mode';
+
+            % Create BottomKnobLabel
+            app.BottomKnobLabel = uilabel(app.UIFigure);
+            app.BottomKnobLabel.HorizontalAlignment = 'center';
+            app.BottomKnobLabel.FontWeight = 'bold';
+            app.BottomKnobLabel.FontColor = [1 1 1];
+            app.BottomKnobLabel.Position = [1658 708 47 22];
+            app.BottomKnobLabel.Text = 'Bottom';
+
+            % Create BottomKnob
+            app.BottomKnob = uiknob(app.UIFigure, 'continuous');
+            app.BottomKnob.FontWeight = 'bold';
+            app.BottomKnob.FontColor = [1 1 1];
+            app.BottomKnob.Position = [1613 742 138 138];
+
+            % Create UpperKnobLabel
+            app.UpperKnobLabel = uilabel(app.UIFigure);
+            app.UpperKnobLabel.HorizontalAlignment = 'center';
+            app.UpperKnobLabel.FontWeight = 'bold';
+            app.UpperKnobLabel.FontColor = [1 1 1];
+            app.UpperKnobLabel.Position = [1269 710 40 22];
+            app.UpperKnobLabel.Text = 'Upper';
+
+            % Create UpperKnob
+            app.UpperKnob = uiknob(app.UIFigure, 'continuous');
+            app.UpperKnob.FontWeight = 'bold';
+            app.UpperKnob.FontColor = [1 1 1];
+            app.UpperKnob.Position = [1220 745 138 138];
+
+            % Create RobotTurretControlPanelMATLABArduinoLabel
+            app.RobotTurretControlPanelMATLABArduinoLabel = uilabel(app.UIFigure);
+            app.RobotTurretControlPanelMATLABArduinoLabel.HorizontalAlignment = 'center';
+            app.RobotTurretControlPanelMATLABArduinoLabel.FontName = 'Courier';
+            app.RobotTurretControlPanelMATLABArduinoLabel.FontSize = 22;
+            app.RobotTurretControlPanelMATLABArduinoLabel.FontWeight = 'bold';
+            app.RobotTurretControlPanelMATLABArduinoLabel.FontColor = [1 1 1];
+            app.RobotTurretControlPanelMATLABArduinoLabel.Position = [439 1003 1044 49];
+            app.RobotTurretControlPanelMATLABArduinoLabel.Text = 'Robot Turret Control Panel – MATLAB ⇆ Arduino';
+
+            % Create ManualControlButton
+            app.ManualControlButton = uibutton(app.UIFigure, 'push');
+            app.ManualControlButton.ButtonPushedFcn = createCallbackFcn(app, @ManualControlButtonPushed, true);
+            app.ManualControlButton.BackgroundColor = [1 0.9098 0.3922];
+            app.ManualControlButton.FontName = 'Sitka Text';
+            app.ManualControlButton.FontSize = 24;
+            app.ManualControlButton.FontColor = [0 0 0];
+            app.ManualControlButton.Position = [954 901 190 60];
+            app.ManualControlButton.Text = 'Manual Control';
+
+            % Create RollLabel
+            app.RollLabel = uilabel(app.UIFigure);
+            app.RollLabel.BackgroundColor = [0.2 0.2 0.2];
+            app.RollLabel.HorizontalAlignment = 'center';
+            app.RollLabel.FontName = 'Sitka Text';
+            app.RollLabel.FontSize = 24;
+            app.RollLabel.FontWeight = 'bold';
+            app.RollLabel.FontColor = [1 1 0];
+            app.RollLabel.Position = [1554 648 249 40];
+            app.RollLabel.Text = 'Roll';
+
+            % Create PitchLabel
+            app.PitchLabel = uilabel(app.UIFigure);
+            app.PitchLabel.BackgroundColor = [0.2 0.2 0.2];
+            app.PitchLabel.HorizontalAlignment = 'center';
+            app.PitchLabel.FontName = 'Sitka Text';
+            app.PitchLabel.FontSize = 24;
+            app.PitchLabel.FontWeight = 'bold';
+            app.PitchLabel.FontColor = [1 1 0];
+            app.PitchLabel.Position = [1165 648 249 40];
+            app.PitchLabel.Text = 'Pitch';
+
+            % Create AdjustLaserPowerSliderLabel
+            app.AdjustLaserPowerSliderLabel = uilabel(app.UIFigure);
+            app.AdjustLaserPowerSliderLabel.HorizontalAlignment = 'right';
+            app.AdjustLaserPowerSliderLabel.FontName = 'Sitka Text';
+            app.AdjustLaserPowerSliderLabel.FontSize = 24;
+            app.AdjustLaserPowerSliderLabel.FontWeight = 'bold';
+            app.AdjustLaserPowerSliderLabel.FontColor = [1 1 1];
+            app.AdjustLaserPowerSliderLabel.Position = [1298 560 237 30];
+            app.AdjustLaserPowerSliderLabel.Text = 'Adjust Laser Power';
+
+            % Create LaserSlider
+            app.LaserSlider = uislider(app.UIFigure);
+            app.LaserSlider.ValueChangedFcn = createCallbackFcn(app, @LaserSliderValueChanged, true);
+            app.LaserSlider.ValueChangingFcn = createCallbackFcn(app, @LaserSliderValueChanging, true);
+            app.LaserSlider.FontName = 'Sitka Text';
+            app.LaserSlider.FontSize = 24;
+            app.LaserSlider.FontWeight = 'bold';
+            app.LaserSlider.FontColor = [1 1 1];
+            app.LaserSlider.Position = [1173 628 604 3];
+
+            % Create FireLaserButton
+            app.FireLaserButton = uibutton(app.UIFigure, 'push');
+            app.FireLaserButton.ButtonPushedFcn = createCallbackFcn(app, @FireLaserButtonPushed, true);
+            app.FireLaserButton.BackgroundColor = [1 0.9098 0.3922];
+            app.FireLaserButton.FontName = 'Sitka Text';
+            app.FireLaserButton.FontSize = 24;
+            app.FireLaserButton.FontColor = [0 0 0];
+            app.FireLaserButton.Position = [957 825 184 68];
+            app.FireLaserButton.Text = 'Fire Laser';
+
+            % Create WebCamTrackerPanel
+            app.WebCamTrackerPanel = uipanel(app.UIFigure);
+            app.WebCamTrackerPanel.TitlePosition = 'centertop';
+            app.WebCamTrackerPanel.Title = 'WebCam Tracker';
+            app.WebCamTrackerPanel.FontName = 'Sitka Text';
+            app.WebCamTrackerPanel.FontSize = 24;
+            app.WebCamTrackerPanel.Position = [16 414 924 589];
+
+            % Create UIAxes
+            app.UIAxes = uiaxes(app.WebCamTrackerPanel);
+            app.UIAxes.AmbientLightColor = [0 1 1];
+            app.UIAxes.XTick = [];
+            app.UIAxes.YTick = [];
+            app.UIAxes.Position = [5 30 904 523];
+
+            % Create LidarMappingUltrasonicPanel
+            app.LidarMappingUltrasonicPanel = uipanel(app.UIFigure);
+            app.LidarMappingUltrasonicPanel.TitlePosition = 'centertop';
+            app.LidarMappingUltrasonicPanel.Title = 'Lidar Mapping + Ultrasonic ';
+            app.LidarMappingUltrasonicPanel.FontName = 'Sitka Text';
+            app.LidarMappingUltrasonicPanel.FontSize = 18;
+            app.LidarMappingUltrasonicPanel.Position = [17 20 456 396];
+
+            % Create SystemPowerLamp_2
+            app.SystemPowerLamp_2 = uilamp(app.UIFigure);
+            app.SystemPowerLamp_2.Position = [1830 975 69 69];
+
+            % Create SignalConditioningPanel
+            app.SignalConditioningPanel = uipanel(app.UIFigure);
+            app.SignalConditioningPanel.TitlePosition = 'centertop';
+            app.SignalConditioningPanel.Title = 'Signal Conditioning';
+            app.SignalConditioningPanel.FontName = 'Sitka Text';
+            app.SignalConditioningPanel.FontSize = 18;
+            app.SignalConditioningPanel.Position = [472 19 468 397];
+
+            % Create LoggerLabel
+            app.LoggerLabel = uilabel(app.UIFigure);
+            app.LoggerLabel.BackgroundColor = [0.8 0.8 0.8];
+            app.LoggerLabel.HorizontalAlignment = 'center';
+            app.LoggerLabel.VerticalAlignment = 'top';
+            app.LoggerLabel.WordWrap = 'on';
+            app.LoggerLabel.FontName = 'Sitka Text';
+            app.LoggerLabel.FontSize = 18;
+            app.LoggerLabel.FontColor = [0.149 0.149 0.149];
+            app.LoggerLabel.Position = [1826 19 73 396];
+            app.LoggerLabel.Text = 'Logger';
+
+            % Create FullRotationButton
+            app.FullRotationButton = uibutton(app.UIFigure, 'push');
+            app.FullRotationButton.WordWrap = 'on';
+            app.FullRotationButton.BackgroundColor = [1 0.9098 0.3922];
+            app.FullRotationButton.FontName = 'Sitka Text';
+            app.FullRotationButton.FontSize = 24;
+            app.FullRotationButton.FontColor = [0 0 0];
+            app.FullRotationButton.Position = [957 563 184 76];
+            app.FullRotationButton.Text = 'Full Rotation';
+
+            % Create Meter2
+            app.Meter2 = uiaudiometer(app.UIFigure);
+            app.Meter2.Position = [1827 446 72 521];
+
+            % Create AdvancedDefenceSystemButton
+            app.AdvancedDefenceSystemButton = uibutton(app.UIFigure, 'push');
+            app.AdvancedDefenceSystemButton.ButtonPushedFcn = createCallbackFcn(app, @AdvancedDefenceSystemButtonPushed, true);
+            app.AdvancedDefenceSystemButton.WordWrap = 'on';
+            app.AdvancedDefenceSystemButton.BackgroundColor = [0 1 0];
+            app.AdvancedDefenceSystemButton.FontName = 'Sitka Text';
+            app.AdvancedDefenceSystemButton.FontSize = 24;
+            app.AdvancedDefenceSystemButton.FontColor = [0 0 0];
+            app.AdvancedDefenceSystemButton.Position = [957 453 184 96];
+            app.AdvancedDefenceSystemButton.Text = 'Advanced Defence System';
+
+            % Create ScanningModeSensorsButton
+            app.ScanningModeSensorsButton = uibutton(app.UIFigure, 'push');
+            app.ScanningModeSensorsButton.WordWrap = 'on';
+            app.ScanningModeSensorsButton.BackgroundColor = [1 0.9098 0.3922];
+            app.ScanningModeSensorsButton.FontName = 'Sitka Text';
+            app.ScanningModeSensorsButton.FontSize = 24;
+            app.ScanningModeSensorsButton.FontColor = [0 0 0];
+            app.ScanningModeSensorsButton.Position = [1355 453 184 96];
+            app.ScanningModeSensorsButton.Text = 'Scanning Mode (Sensors)';
+
+            % Create TurnWebcamOFFButton
+            app.TurnWebcamOFFButton = uibutton(app.UIFigure, 'push');
+            app.TurnWebcamOFFButton.ButtonPushedFcn = createCallbackFcn(app, @TurnWebcamOFFButtonPushed, true);
+            app.TurnWebcamOFFButton.WordWrap = 'on';
+            app.TurnWebcamOFFButton.BackgroundColor = [1 0.9098 0.3922];
+            app.TurnWebcamOFFButton.FontName = 'Sitka Text';
+            app.TurnWebcamOFFButton.FontSize = 24;
+            app.TurnWebcamOFFButton.FontColor = [0 0 0];
+            app.TurnWebcamOFFButton.Position = [1559 453 240 96];
+            app.TurnWebcamOFFButton.Text = 'Turn Webcam OFF';
+
+            % Create DefenceSystemMotionButton
+            app.DefenceSystemMotionButton = uibutton(app.UIFigure, 'push');
+            app.DefenceSystemMotionButton.ButtonPushedFcn = createCallbackFcn(app, @DefenceSystemMotionButtonPushed, true);
+            app.DefenceSystemMotionButton.WordWrap = 'on';
+            app.DefenceSystemMotionButton.BackgroundColor = [1 0.9098 0.3922];
+            app.DefenceSystemMotionButton.FontName = 'Sitka Text';
+            app.DefenceSystemMotionButton.FontSize = 24;
+            app.DefenceSystemMotionButton.FontColor = [0 0 0];
+            app.DefenceSystemMotionButton.Position = [1157 453 184 96];
+            app.DefenceSystemMotionButton.Text = 'Defence System [Motion]';
+
+            % Create LidarLabel
+            app.LidarLabel = uilabel(app.UIFigure);
+            app.LidarLabel.BackgroundColor = [0.949 0.4039 0.7725];
+            app.LidarLabel.HorizontalAlignment = 'center';
+            app.LidarLabel.FontName = 'Sitka Text';
+            app.LidarLabel.FontSize = 48;
+            app.LidarLabel.FontColor = [0 0 0];
+            app.LidarLabel.Position = [1395 362 391 59];
+            app.LidarLabel.Text = 'LidarLabel';
+
+            % Create FluxLabel
+            app.FluxLabel = uilabel(app.UIFigure);
+            app.FluxLabel.BackgroundColor = [0.949 0.4039 0.7725];
+            app.FluxLabel.HorizontalAlignment = 'center';
+            app.FluxLabel.FontName = 'Sitka Text';
+            app.FluxLabel.FontSize = 48;
+            app.FluxLabel.FontColor = [0 0 0];
+            app.FluxLabel.Position = [990 363 391 59];
+            app.FluxLabel.Text = {'FluxLabel'; ''};
+
+            % Create TempLabel
+            app.TempLabel = uilabel(app.UIFigure);
+            app.TempLabel.BackgroundColor = [0.949 0.4039 0.7725];
+            app.TempLabel.HorizontalAlignment = 'center';
+            app.TempLabel.FontName = 'Sitka Text';
+            app.TempLabel.FontSize = 48;
+            app.TempLabel.FontColor = [0 0 0];
+            app.TempLabel.Position = [990 285 391 59];
+            app.TempLabel.Text = 'TempLabel';
+
+            % Create UltraLabel
+            app.UltraLabel = uilabel(app.UIFigure);
+            app.UltraLabel.BackgroundColor = [0.949 0.4039 0.7725];
+            app.UltraLabel.HorizontalAlignment = 'center';
+            app.UltraLabel.FontName = 'Sitka Text';
+            app.UltraLabel.FontSize = 48;
+            app.UltraLabel.FontColor = [0 0 0];
+            app.UltraLabel.Position = [1395 285 391 59];
+            app.UltraLabel.Text = 'UltraLabel';
+
+            % Show the figure after all components are created
+            app.UIFigure.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = upperbottomservocontroller_newest
+
+            % Create UIFigure and components
+            createComponents(app)
+
+            % Register the app with App Designer
+            registerApp(app, app.UIFigure)
+
+            % Execute the startup function
+            runStartupFcn(app, @startupFcn)
+
+            if nargout == 0
+                clear app
+            end
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+
+            % Delete UIFigure when app is deleted
+            delete(app.UIFigure)
+        end
+    end
+end
