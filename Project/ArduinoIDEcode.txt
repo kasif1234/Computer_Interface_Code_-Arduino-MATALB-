@@ -1,0 +1,557 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <TFLI2C.h>
+ 
+TFLI2C tflI2C;
+ 
+// ---------- LIDAR (TF-Luna I2C) ----------
+int16_t dist;      // distance in cm (LiDAR)
+int16_t flux;      // signal strength
+int16_t tempRaw;   // temperature in °C * 100
+int16_t addr = TFL_DEF_ADR;
+ 
+// ---------- ULTRASONIC PINS ----------
+const int ULTRA_TRIG_PIN = 7;
+const int ULTRA_ECHO_PIN = 8;
+ 
+ 
+// ================== PIN DEFINITIONS ==================
+#define LASER_PIN         5
+#define BOTTOM_SERVO_PIN  2
+#define UPPER_SERVO_PIN   3
+ 
+// Frame size (from MATLAB) – defaults if nothing sent yet
+int frameWidth  = 640;
+int frameHeight = 480;
+ 
+ 
+#define POT_BOTTOM A0
+#define POT_UPPER  A1
+ 
+// ================== CALIBRATION ==================
+// Bottom (pan) servo: 50–130, center 90
+const int BOTTOM_MAX    = 137;
+const int BOTTOM_CENTER = 90;
+const int BOTTOM_MIN = 43;
+ 
+ 
+// Top (tilt) servo: 0–28, center 14
+const int UPPER_MIN     = 0;
+const int UPPER_MAX     = 32;
+const int UPPER_CENTER  = 16;
+ 
+// ================== GLOBALS ==================
+Servo bottomServo;
+Servo upperServo;
+ 
+String cmd = "";
+bool potMode = false;
+ 
+// ================== FUSION METRICS (NEW) ==================
+// Smoothing window for LiDAR distance
+const int WINDOW_N = 10;
+float distHist[WINDOW_N];   // history of LiDAR distances (cm)
+int   histIndex = 0;        // index into distHist
+bool  histFull  = false;    // has the window filled at least once?
+ 
+// Time history for velocity/acceleration
+unsigned long prevMs   = 0;   // previous timestamp (ms)
+float         prevDist = 0.0; // previous LiDAR distance (cm)
+float         prevVel  = 0.0; // previous relative velocity (cm/s)
+ 
+// Derived metrics
+float tempC      = 0.0f;   // LiDAR temperature in °C
+float distFilt   = 0.0f;   // smoothed LiDAR distance (cm)
+float distStd    = 0.0f;   // local noise (standard deviation, cm)
+float velocity   = 0.0f;   // relative velocity (cm/s) (negative = approaching)
+float accel      = 0.0f;   // relative acceleration (cm/s^2)
+float ttc        = -1.0f;  // LiDAR-only time-to-collision (s), -1 = no collision
+ 
+// Ultrasonic + fusion metrics
+float ultraDist    = -1.0f; // ultrasonic distance (cm)
+float fusedDist    = -1.0f; // fused distance (cm)
+float fusedTTC     = -1.0f; // fused time-to-collision (s), -1 = not approaching
+ 
+// Zone / quality flags
+int zoneLidar      = 0;     // LiDAR-only zone: 0 = safe, 1 = caution, 2 = danger
+int fusedZone      = -1;    // fused zone: -1 = unknown, 0 = safe, 1 = caution, 2 = danger
+int qualityLidar   = 0;     // 1 = LiDAR reading trusted, 0 = not trusted
+int ultraQuality   = 0;     // 1 = ultrasonic reading trusted, 0 = not trusted
+int fusedQuality   = 0;     // 0 = none, 1 = one sensor, 2 = both agree
+ 
+// Navigation command summary
+int    navCmd    = 0;       // 0..8 command code
+String navText   = "";      // text version of command (CLEAR, SLOW_DOWN, etc.)
+String navReason = "";      // explanation for command (TOO_CLOSE, BAD_SENSORS, ...)
+ 
+// ================== THRESHOLDS (NEW) ==================
+// Distance thresholds for zones (cm)
+const float SAFE_DIST_CM    = 250.0f;  // > 2.5 m  -> safe
+const float CAUTION_DIST_CM = 150.0f;  // 1.5–2.5 m -> caution
+const float DANGER_DIST_CM  = 80.0f;   // < 0.8 m  -> danger
+ 
+// Minimum LiDAR flux to consider reading good
+const int   MIN_FLUX = 30;
+ 
+// Ultrasonic expected range
+const float ULTRA_MIN_CM = 2.0f;
+const float ULTRA_MAX_CM = 400.0f;
+ 
+// Small epsilon to avoid division by zero in TTC
+const float EPS = 1e-3f;
+ 
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  delay(50);
+ 
+  bottomServo.attach(BOTTOM_SERVO_PIN);
+  upperServo.attach(UPPER_SERVO_PIN);
+ 
+  // Start at calibrated centers
+  bottomServo.write(BOTTOM_CENTER);
+  upperServo.write(UPPER_CENTER);
+ 
+  pinMode(LASER_PIN, OUTPUT);
+  analogWrite(LASER_PIN, 0);   // start off (0 brightness)
+ 
+   // ---- Ultrasonic init ----
+  pinMode(ULTRA_TRIG_PIN, OUTPUT);  // <---- ADD
+  pinMode(ULTRA_ECHO_PIN, INPUT);   // <---- ADD
+  digitalWrite(ULTRA_TRIG_PIN, LOW);// <---- ADD
+ 
+  // Init smoothing buffer
+  for (int i = 0; i < WINDOW_N; i++) {
+    distHist[i] = 0.0f;
+  }
+ 
+  Serial.println("Ready. Commands: 0,1,2,3,Lxx,Pxxx Tyyy");
+}
+ 
+void loop() {
+ 
+  if (Serial.available()) {
+    cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.length() == 0) return;
+ 
+    char c = cmd.charAt(0);
+ 
+    // ----- SERVO MODES -----
+    if (c == '0') {
+      potMode = false;
+      Serial.println("Bottom Servo Sweep (calibrated range)");
+     
+      // Sweep only within safe range for bottom servo
+      for (int pos = 0; pos <= 180; pos++) {
+        bottomServo.write(pos);
+        delay(5);
+      }
+      for (int pos = 180; pos >= 0; pos--) {
+        bottomServo.write(pos);
+        delay(5);
+      }
+    }
+ 
+    else if (c == '1') {
+      potMode = false;
+      Serial.println("Upper Servo Sweep (calibrated range)");
+     
+      // Sweep only within safe range for upper servo
+      for (int pos = 0; pos <= 180; pos++) {
+        upperServo.write(pos);
+        delay(5);
+      }
+      for (int pos = 180; pos >= 0; pos--) {
+        upperServo.write(pos);
+        delay(5);
+      }
+    }
+ 
+    else if (c == '2') {
+      potMode = false;
+      Serial.println("Laser Fired FULL");
+      analogWrite(LASER_PIN, 255);   // full brightness
+      delay(100);
+      analogWrite(LASER_PIN, 0);
+    }
+ 
+    else if (c == '3') {
+      potMode = true;
+      Serial.println("ENTERING POT MODE (continuous)");
+ 
+      while (potMode) {
+        // any incoming serial breaks pot mode
+        if (Serial.available()) {
+          potMode = false;
+          break;
+        }
+ 
+        int bottomRaw = analogRead(POT_BOTTOM);
+        int upperRaw  = analogRead(POT_UPPER);
+ 
+        // Map pots to calibrated servo ranges
+        int bottomAngle = map(bottomRaw, 0, 1023, 0, 180);
+        int upperAngle  = map(upperRaw,  0, 1023, 0,  180);
+ 
+        // Just in case, clamp
+        bottomAngle = constrain(bottomAngle, 0, 180);
+        upperAngle  = constrain(upperAngle,  0,  180);
+ 
+        bottomServo.write(bottomAngle);
+        upperServo.write(upperAngle);
+ 
+        Serial.print("Pot control -> bottom: ");
+        Serial.print(bottomAngle);
+        Serial.print("  upper: ");
+        Serial.println(upperAngle);
+ 
+        delay(50);
+      }
+      Serial.println("EXITED POT MODE");
+    }
+ 
+        // ----- NEW: Simple LiDAR + Ultrasonic stream -----
+    else if (c == '4') {
+      Serial.println("LiDAR + Ultrasonic FUSION stream. Send any key to exit.");
+ 
+      bool sensorMode = true;
+      while (sensorMode) {
+        if (Serial.available()) {
+          sensorMode = false;
+          Serial.read();  // flush exit char
+          break;
+        }
+ 
+        // ---- Read LiDAR ----
+        int16_t d  = -1;
+        int16_t fx = 0;
+        int16_t tR = 0;
+ 
+        if (tflI2C.getData(d, fx, tR, addr)) {
+          unsigned long nowMs = millis();
+          float dt = (prevMs == 0) ? 0.0f : (nowMs - prevMs) / 1000.0f;
+ 
+          // Raw LiDAR data
+          dist   = d;
+          flux   = fx;
+          tempRaw = tR;
+          tempC  = tempRaw / 100.0f;
+ 
+          // ---------- Update smoothing history ----------
+          distHist[histIndex] = (float)dist;
+          histIndex++;
+          if (histIndex >= WINDOW_N) {
+            histIndex = 0;
+            histFull  = true;
+          }
+ 
+          int count = histFull ? WINDOW_N : histIndex;
+          if (count <= 0) {
+            count = 1;
+          }
+ 
+          // Moving average
+          float sum = 0.0f;
+          for (int i = 0; i < count; i++) {
+            sum += distHist[i];
+          }
+          distFilt = sum / (float)count;
+ 
+          // Standard deviation (noise)
+          float var = 0.0f;
+          for (int i = 0; i < count; i++) {
+            float diff = distHist[i] - distFilt;
+            var += diff * diff;
+          }
+          distStd = (count > 1) ? sqrt(var / (float)(count - 1)) : 0.0f;
+ 
+          // ---------- Velocity & acceleration ----------
+          if (dt > 0.0f) {
+            velocity = ((float)dist - prevDist) / dt;    // cm/s
+            accel    = (velocity - prevVel) / dt;        // cm/s^2
+          } else {
+            velocity = 0.0f;
+            accel    = 0.0f;
+          }
+ 
+          // ---------- LiDAR-only TTC ----------
+          if (velocity < -EPS) {
+            ttc = (float)dist / (-velocity);   // s
+          } else {
+            ttc = -1.0f;
+          }
+ 
+          // ---------- LiDAR quality & zone ----------
+          if (dist > 0 && dist < 800 && flux > MIN_FLUX && distStd < 10.0f) {
+            qualityLidar = 1;
+          } else {
+            qualityLidar = 0;
+          }
+ 
+          if (dist <= DANGER_DIST_CM) {
+            zoneLidar = 2;  // DANGER
+          } else if (dist <= CAUTION_DIST_CM) {
+            zoneLidar = 1;  // CAUTION
+          } else {
+            zoneLidar = 0;  // SAFE
+          }
+ 
+          // ---- Read Ultrasonic ----
+          ultraDist = readUltrasonicCm();
+          if (ultraDist >= ULTRA_MIN_CM && ultraDist <= ULTRA_MAX_CM) {
+            ultraQuality = 1;
+          } else {
+            ultraQuality = 0;
+          }
+ 
+          // ---------- FUSION: fused distance & quality ----------
+          if (qualityLidar == 1 && ultraQuality == 1) {
+            fusedDist    = (distFilt < ultraDist) ? distFilt : ultraDist;
+            fusedQuality = 2;  // both good
+          } else if (qualityLidar == 1) {
+            fusedDist    = distFilt;
+            fusedQuality = 1;  // only LiDAR
+          } else if (ultraQuality == 1) {
+            fusedDist    = ultraDist;
+            fusedQuality = 1;  // only ultrasonic
+          } else {
+            fusedDist    = -1.0f;
+            fusedQuality = 0;  // none
+          }
+ 
+          // ---------- Fused zone ----------
+          if (fusedDist < 0.0f) {
+            fusedZone = -1;   // UNKNOWN
+          } else if (fusedDist <= DANGER_DIST_CM) {
+            fusedZone = 2;    // DANGER
+          } else if (fusedDist <= CAUTION_DIST_CM) {
+            fusedZone = 1;    // CAUTION
+          } else {
+            fusedZone = 0;    // SAFE
+          }
+ 
+          // ---------- Fused TTC ----------
+          if (fusedDist > 0.0f && velocity < -EPS) {
+            fusedTTC = fusedDist / (-velocity);
+          } else {
+            fusedTTC = -1.0f;
+          }
+ 
+          // ---------- Navigation command (simplified) ----------
+          navReason = "UNKNOWN";
+ 
+          if (fusedQuality == 0 || fusedZone == -1) {
+            navCmd    = 3;  // HOVER_SENSOR_FAIL / hold
+            navReason = "BAD_SENSORS";
+          }
+          else if ((fusedTTC > 0 && fusedTTC < 0.4f) || fusedZone == 2) {
+            navCmd    = 2;  // EMERGENCY_BRAKE
+            navReason = (fusedTTC > 0 && fusedTTC < 0.4f) ?
+                         "APPROACHING_FAST" : "TOO_CLOSE";
+          }
+          else if ((fusedTTC > 0 && fusedTTC < 1.2f) || fusedZone == 1) {
+            navCmd    = 1;  // SLOW_DOWN
+            navReason = (fusedTTC > 0 && fusedTTC < 1.2f) ?
+                         "CLOSING_DISTANCE" : "MODERATE_RANGE";
+          }
+          else {
+            navCmd    = 0;  // CLEAR
+            navReason = "CLEAR_PATH";
+          }
+ 
+          // navCmd -> text
+          switch (navCmd) {
+            case 0: navText = "CLEAR";             break;
+            case 1: navText = "SLOW_DOWN";         break;
+            case 2: navText = "EMERGENCY_BRAKE";   break;
+            case 3: navText = "HOVER_SENSOR_FAIL"; break;
+            default: navText = "UNKNOWN";          break;
+          }
+ 
+          // ---------- TELEMETRY PRINT (OLD + NEW METRICS) ----------
+          Serial.print("t_ms=");
+          Serial.print(nowMs);
+          Serial.print(", LiDAR_dist_cm=");
+          Serial.print(dist);
+          Serial.print(", flux=");
+          Serial.print(flux);
+          Serial.print(", temp_C=");
+          Serial.print(tempC, 1);
+          Serial.print(", Ultra_dist_cm=");
+          Serial.print(ultraDist, 1);
+ 
+          // New metrics:
+          Serial.print(", dist_filt_cm=");
+          Serial.print(distFilt, 2);
+          Serial.print(", dist_std_cm=");
+          Serial.print(distStd, 2);
+          Serial.print(", vel_cm_s=");
+          Serial.print(velocity, 2);
+          Serial.print(", acc_cm_s2=");
+          Serial.print(accel, 2);
+          Serial.print(", ttc_s=");
+          Serial.print(ttc, 2);
+          Serial.print(", zone_lidar=");
+          Serial.print(zoneLidar);
+          Serial.print(", quality_lidar=");
+          Serial.print(qualityLidar);
+          Serial.print(", fused_dist_cm=");
+          Serial.print(fusedDist, 2);
+          Serial.print(", zone_fused=");
+          Serial.print(fusedZone);
+          Serial.print(", fused_ttc_s=");
+          Serial.print(fusedTTC, 2);
+          Serial.print(", fused_quality=");
+          Serial.print(fusedQuality);
+          Serial.print(", nav_cmd=");
+          Serial.print(navCmd);
+          Serial.print(", nav_text=");
+          Serial.print(navText);
+          Serial.print(", reason=");
+          Serial.println(navReason);
+ 
+          // Update history for next loop
+          prevMs   = nowMs;
+          prevDist = (float)dist;
+          prevVel  = velocity;
+ 
+        } else {
+          // LiDAR error / timeout
+          tflI2C.printStatus();
+        }
+ 
+        delay(100); // ~10 Hz
+      }
+ 
+   
+    }
+ 
+ 
+    // ----- LASER BRIGHTNESS COMMAND -----
+    else if (c == 'L') {
+      // Expect something like "L0".."L100"
+      String valStr = cmd.substring(1);      // after 'L'
+      int percent = valStr.toInt();          // 0–100 from MATLAB
+      percent = constrain(percent, 0, 100);
+ 
+      int pwm = map(percent, 0, 100, 0, 255);
+      analogWrite(LASER_PIN, pwm);
+ 
+      Serial.print("Laser power set to ");
+      Serial.print(percent);
+      Serial.println("%");
+    }
+ 
+    // ----- Pan/Tilt from MATLAB tracking: "Pxxx Tyyy" -----
+    else if (c == 'P') {
+      int panVal  = BOTTOM_CENTER;
+      int tiltVal = UPPER_CENTER;
+ 
+      // Expect format like:  P090 T014
+      int matched = sscanf(cmd.c_str(), "P%d T%d", &panVal, &tiltVal);
+ 
+      if (matched == 2) {
+        // Clamp to calibrated ranges
+        panVal  = constrain(panVal,  BOTTOM_MIN, BOTTOM_MAX);
+        tiltVal = constrain(tiltVal, UPPER_MIN,  UPPER_MAX);
+ 
+        bottomServo.write(panVal);   // pan servo
+        upperServo.write(tiltVal);   // tilt servo
+ 
+        Serial.print("Tracking -> bottom: ");
+        Serial.print(panVal);
+        Serial.print("  upper: ");
+        Serial.println(tiltVal);
+      } else {
+        Serial.println("Bad P/T format");
+      }
+    }
+        // ----- NEW: Frame size from MATLAB: "F<width> <height>" -----
+    else if (c == 'F') {
+      int w = frameWidth;
+      int h = frameHeight;
+ 
+      int matched = sscanf(cmd.c_str(), "F%d %d", &w, &h);
+      if (matched == 2 && w > 0 && h > 0) {
+        frameWidth  = w;
+        frameHeight = h;
+ 
+        Serial.print("Frame size set to ");
+        Serial.print(frameWidth);
+        Serial.print(" x ");
+        Serial.println(frameHeight);
+      } else {
+        Serial.println("Bad F format");
+      }
+    }
+ 
+        // ----- NEW: Target pixel from MATLAB: "X<x> Y<y>" -----
+    else if (c == 'X') {
+      int xPix = 0;
+      int yPix = 0;
+ 
+      // Expect "X123 Y456"  (x,y are 0-based pixels)
+      int matched = sscanf(cmd.c_str(), "X%d Y%d", &xPix, &yPix);
+      if (matched == 2) {
+        // Clamp pixels to current frame size
+        if (frameWidth  <= 1) frameWidth  = 640;
+        if (frameHeight <= 1) frameHeight = 480;
+ 
+        xPix = constrain(xPix, 0, frameWidth  - 1);
+        yPix = constrain(yPix, 0, frameHeight - 1);
+ 
+        // HORIZONTAL: invert (left → BOTTOM_MAX, right → BOTTOM_MIN)
+        float normX = (float)xPix / (float)(frameWidth - 1);
+        int panAngle = BOTTOM_MAX - (int)(normX * (BOTTOM_MAX - BOTTOM_MIN));
+ 
+        // VERTICAL: invert (top → UPPER_MAX, bottom → UPPER_MIN)
+        float normY = (float)yPix / (float)(frameHeight - 1);
+        int tiltAngle = UPPER_MAX - (int)(normY * (UPPER_MAX - UPPER_MIN));
+ 
+ 
+        // Safety clamp
+        panAngle  = constrain(panAngle,  BOTTOM_MIN, BOTTOM_MAX);
+        tiltAngle = constrain(tiltAngle, UPPER_MIN,  UPPER_MAX);
+ 
+        bottomServo.write(panAngle);
+        upperServo.write(tiltAngle);
+ 
+        Serial.print("Pixel target -> x=");
+        Serial.print(xPix);
+        Serial.print(" y=");
+        Serial.print(yPix);
+        Serial.print("  ==> bottom=");
+        Serial.print(panAngle);
+        Serial.print(" upper=");
+        Serial.println(tiltAngle);
+      } else {
+        Serial.println("Bad X/Y format");
+      }
+    }
+ 
+ 
+    else {
+      Serial.println("Invalid Command");
+    }
+  }
+}
+ 
+float readUltrasonicCm() {
+  // Trigger pulse
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRA_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
+ 
+  // Echo pulse (timeout ~30ms -> ~5m max)
+  unsigned long duration = pulseIn(ULTRA_ECHO_PIN, HIGH, 30000UL);
+  if (duration == 0) {
+    return -1.0f;  // no echo / invalid
+  }
+ 
+  // Speed of sound ~343 m/s => ~29.1 us/cm round-trip
+  float distanceCm = duration / 58.0f;   // common HC-SR04 formula
+  return distanceCm;
+}
